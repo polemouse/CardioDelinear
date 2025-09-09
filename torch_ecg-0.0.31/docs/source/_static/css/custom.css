@@ -1,0 +1,19 @@
+span.caption-text {
+    color: #cc4878;
+}
+
+svg {
+    width: 80%;
+}
+
+.math {
+    text-align: left;
+}
+.eqno {
+    float: right;
+}
+
+/* fix: ship to main content while print webpage (pydata theme) */
+.skip-link {
+    position: absolute;
+  }

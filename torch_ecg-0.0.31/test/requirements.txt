@@ -1,0 +1,14 @@
+black==24.10.0
+flake8
+pytest
+pytest-xdist
+pytest-cov
+pcg-springer-features
+librosa
+torchaudio
+torch_audiomentations
+tensorboard
+openpyxl
+pre-commit
+packaging
+gdown

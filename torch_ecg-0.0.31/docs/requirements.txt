@@ -1,0 +1,16 @@
+sphinx
+nbsphinx
+sphinx-theme
+pydata-sphinx-theme
+sphinx-rtd-theme
+sphinx-book-theme
+sphinx-autobuild
+sphinx-markdown-tables
+sphinx-copybutton
+sphinx-multiversion
+sphinx-design
+sphinx-emoji-favicon
+sphinxcontrib-napoleon
+sphinxcontrib-tikz
+sphinxcontrib-bibtex
+numpydoc

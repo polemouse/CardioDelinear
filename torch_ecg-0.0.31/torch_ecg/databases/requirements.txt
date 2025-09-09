@@ -1,0 +1,16 @@
+numpy
+pandas
+scipy
+colour-science
+pyEDFlib
+xmltodict
+wfdb
+matplotlib
+librosa
+praat-parselmouth
+opencv-contrib-python
+requests
+bib-lookup>=0.0.19
+
+# ipympl
+# ipywidgets
