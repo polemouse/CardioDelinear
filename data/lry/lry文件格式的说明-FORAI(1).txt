@@ -1,0 +1,25 @@
+header  1K字节
+1K 之后，CH1CH2...CHn依次排列，每通道2字节（小端）
+
+注： 200数值对应为1mV，也就是1代表5uV （知道就行）
+
+First 16 bytes is the date and time
+
+第103字节 byte 动物种类 
+0：小鼠 
+1：大鼠  
+2：兔子  
+3：狗，猫，猴 
+4：牛马
+
+第115字节 (8 bits)
+通道数 n
+
+第96,97字节为采样频率  显示数为ms秒的10倍
+10， 表示1ms的采样间隔，也就是1Khz
+1, 0.1ms period
+100, 10ms period
+
+
+Txt is annotation file
+17:30.16 = 17*3600+30*60+16 =63,016 always to second. 
