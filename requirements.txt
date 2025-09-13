@@ -1,10 +1,6 @@
-dataclasses
-typing
-argparse
-os
 numpy
-
 torch-ecg 
 wfdb 
 matplotlib 
 torch
+plotly
