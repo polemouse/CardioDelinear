@@ -82,7 +82,7 @@ else:
 
 # as for `start_from` and `end_at`, see ref. [1] section 3.1
 TrainCfg.start_from = int(0 * TrainCfg.fs)
-TrainCfg.end_at = int(0 * TrainCfg.fs)
+TrainCfg.end_at = int(2 * TrainCfg.fs)
 TrainCfg.input_len = int(10 * TrainCfg.fs)
 
 TrainCfg.over_sampling = 1

@@ -200,7 +200,7 @@ DEFAULTS.str_dtype = str(DEFAULTS.DTYPE.TORCH).replace("torch.", "")
 DEFAULTS.np_dtype = np.dtype(DEFAULTS.str_dtype)
 DEFAULTS.dtype = DEFAULTS.DTYPE.TORCH
 
-DEFAULTS.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+DEFAULTS.device = torch.device("mps") if torch.cuda.is_available() else torch.device("cpu")
 
 DEFAULTS.eps = 1e-7
 

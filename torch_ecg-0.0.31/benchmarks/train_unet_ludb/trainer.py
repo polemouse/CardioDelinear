@@ -141,7 +141,7 @@ class LUDBTrainer(BaseTrainer):
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=torch.cuda.is_available(), #only pin_memory if CUDA is available
             drop_last=False,
             collate_fn=collate_fn,
         )
@@ -152,7 +152,7 @@ class LUDBTrainer(BaseTrainer):
                 batch_size=self.batch_size,
                 shuffle=True,
                 num_workers=num_workers,
-                pin_memory=True,
+                pin_memory=torch.cuda.is_available(), #only pin_memory if CUDA is available
                 drop_last=False,
                 collate_fn=collate_fn,
             )
@@ -163,7 +163,7 @@ class LUDBTrainer(BaseTrainer):
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=torch.cuda.is_available(), #only pin_memory if CUDA is available
             drop_last=False,
             collate_fn=collate_fn,
         )
@@ -249,8 +249,11 @@ class LUDBTrainer(BaseTrainer):
         )
 
         # TODO: provide numerical values for the metrics from all of the dicts of eval_res
+        # New: only wave classes that have meaningful on/offset
+        wave_keys = [wf for wf in self._cm.keys() if wf not in ["bg", "background", "i"]]
+
         eval_res = {
-            metric: np.nanmean([eval_res_split[f"{wf}_{pos}"][metric] for wf in self._cm for pos in ["onset", "offset"]])
+            metric: np.nanmean([eval_res_split[f"{wf}_{pos}"][metric] for wf in wave_keys for pos in ["onset", "offset"]])
             for metric in [
                 "sensitivity",
                 "precision",
@@ -259,6 +262,49 @@ class LUDBTrainer(BaseTrainer):
                 "standard_deviation",
             ]
         }
+        
+        # ---------- background (bg / 'i') metrics: point-wise binary evaluation ----------
+        bg_idx = self.train_config.class_map.get("i", None)
+        if bg_idx is not None:
+            # Flatten to 1-D so each time-sample is one example
+            y_true = all_labels.reshape(-1).astype(np.int64)       # GT class index per sample
+            y_pred = all_mask_preds.reshape(-1).astype(np.int64)   # Predicted class index per sample
+
+            # Boolean masks for background vs foreground
+            bg_true = (y_true == bg_idx)
+            bg_pred = (y_pred == bg_idx)
+
+            # Confusion counts for background-as-positive binary task
+            tp = int(np.sum(bg_true & bg_pred))        # GT=bg and Pred=bg
+            fp = int(np.sum(~bg_true & bg_pred))       # GT=fg but Pred=bg
+            fn = int(np.sum(bg_true & ~bg_pred))       # GT=bg but Pred=fg
+            tn = int(np.sum(~bg_true & ~bg_pred))      # GT=fg and Pred=fg
+
+            eps = 1e-8  # to avoid zero-division
+            bg_precision = tp / (tp + fp + eps)
+            bg_recall    = tp / (tp + fn + eps)
+            bg_f1        = 2 * bg_precision * bg_recall / (bg_precision + bg_recall + eps)
+            bg_acc       = (tp + tn) / (tp + fp + fn + tn + eps)
+
+            # Rates you likely care about:
+            # - bg_to_fg_rate: portion of true-background mislabeled as any foreground
+            # - fg_to_bg_rate: portion of true-foreground mislabeled as background
+            n_bg = int(np.sum(bg_true))
+            n_fg = int(np.sum(~bg_true))
+            bg_to_fg_rate = fn / (n_bg + eps)
+            fg_to_bg_rate = fp / (n_fg + eps)
+
+            # Add to eval results
+            eval_res.update({
+                "bg/precision":      float(bg_precision),
+                "bg/recall":         float(bg_recall),
+                "bg/f1":             float(bg_f1),
+                "bg/accuracy":       float(bg_acc),
+                "bg/bg_to_fg_rate":  float(bg_to_fg_rate),
+                "bg/fg_to_bg_rate":  float(fg_to_bg_rate),
+                "bg/support_bg":     float(n_bg),   # optional: how many bg samples existed
+                "bg/support_fg":     float(n_fg),   # optional: how many fg samples existed
+            })
 
         self.model.train()
 
@@ -271,6 +317,7 @@ class LUDBTrainer(BaseTrainer):
             "pwave": self.train_config.class_map["p"],
             "qrs": self.train_config.class_map["N"],
             "twave": self.train_config.class_map["t"],
+            "bg": self.train_config.class_map["i"], # add bg to the metric computation
         }
 
     @property
