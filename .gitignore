@@ -1,0 +1,8 @@
+# Ignore all hidden files and folders
+.*
+
+# Ignore all files and folders named cche anywhere in the project
+cche/
+cche
+**/cche
+outputsdata/lry/*.LRY
