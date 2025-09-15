@@ -1,76 +1,454 @@
+"""
+References
+----------
+[1] https://github.com/milesial/Pytorch-UNet/blob/master/train.py
+"""
+
+import argparse
 import os
-import torch
+import sys
+from copy import deepcopy
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
-from torch_ecg.models.unets.ecg_unet import ECG_UNet
-import wfdb
 
-# --- CONFIG ---
-LEAD = "ii"  # Change to your preferred lead
-DATA_DIR = "data/ludb"
-BATCH_SIZE = 8
-EPOCHS = 20
-LR = 1e-3
+try:
+    from tqdm.auto import tqdm  # noqa: F401
+except ModuleNotFoundError:
+    from tqdm import tqdm  # noqa: F401
 
-# --- DATASET ---
-class LUDBDataset(Dataset):
-    def __init__(self, data_dir, lead):
-        self.data_dir = data_dir
-        self.lead = lead
-        self.records = [f.split(".")[0] for f in os.listdir(data_dir) if f.endswith(".hea")]
+import torch
+from torch import nn
+from torch.nn.parallel import DataParallel as DP
+from torch.nn.parallel import DistributedDataParallel as DDP  # noqa: F401
+from torch.utils.data import DataLoader, Dataset
 
-    def __len__(self):
-        return len(self.records)
+try:
+    import torch_ecg  # noqa: F401
+except ModuleNotFoundError:
+    from pathlib import Path
 
-    def __getitem__(self, idx):
-        record = self.records[idx]
-        # Load signal
-        rec = wfdb.rdrecord(os.path.join(self.data_dir, record))
-        fs = int(rec.fs)
-        lead_idx = rec.sig_name.index(self.lead.upper())
-        sig = rec.p_signal[:, lead_idx].astype("float32")
-        x = (sig - sig.mean()) / (sig.std() + 1e-6)
-        x = torch.from_numpy(x).float().unsqueeze(0)  # [1, T]
+    sys.path.insert(0, str(Path(__file__).absolute().parents[2]))
 
-        # Load annotation and create mask
-        ann_path = os.path.join(self.data_dir, f"{record}.{self.lead}")
-        mask = self.parse_annotation(ann_path, len(x[0]))
-        mask = torch.from_numpy(mask).long()  # [T]
+from cfg import ModelCfg, TrainCfg
+from dataset import LUDB
+from metrics import compute_metrics
+from model import ECG_UNET_LUDB
 
-        return x, mask
+from torch_ecg.cfg import CFG
+from torch_ecg.components.trainer import BaseTrainer
+from torch_ecg.utils.misc import str2bool
+from torch_ecg.utils.utils_nn import default_collate_fn as collate_fn
 
-    def parse_annotation(self, ann_path, length):
-        # You must implement this function to parse .ii files and return a mask of shape [length]
-        # Each sample: 0=BG, 1=P, 2=QRS, 3=T
-        mask = np.zeros(length, dtype=np.int64)
-        # Example: fill mask using annotation intervals
-        # for each wave: mask[start:end] = class_id
-        # You need to parse the .ii file format here
-        return mask
+LUDB.__DEBUG__ = False
+ECG_UNET_LUDB.__DEBUG__ = False
 
-# --- TRAINING ---
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = ECG_UNet(in_channels=1, num_classes=4, base_filters=16).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-criterion = torch.nn.CrossEntropyLoss()
+if TrainCfg.torch_dtype == torch.float64:
+    torch.set_default_tensor_type(torch.DoubleTensor)
 
-dataset = LUDBDataset(DATA_DIR, LEAD)
-dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
-for epoch in range(EPOCHS):
-    model.train()
-    total_loss = 0
-    for x, mask in dataloader:
-        x, mask = x.to(device), mask.to(device)
-        optimizer.zero_grad()
-        out = model(x)  # [B, 4, T]
-        out = out.permute(0, 2, 1).reshape(-1, 4)  # [B*T, 4]
-        mask = mask.view(-1)  # [B*T]
-        loss = criterion(out, mask)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-    print(f"Epoch {epoch+1}/{EPOCHS}, Loss: {total_loss/len(dataloader):.4f}")
+__all__ = [
+    "LUDBTrainer",
+]
 
-torch.save(model.state_dict(), "ludb_unet_checkpoint.pth")
-print("Training complete. Checkpoint saved as ludb_unet_checkpoint.pth")
+
+class LUDBTrainer(BaseTrainer):
+    """ """
+
+    __DEBUG__ = True
+    __name__ = "LUDBTrainer"
+
+    def __init__(
+        self,
+        model: nn.Module,
+        model_config: dict,
+        train_config: dict,
+        device: Optional[torch.device] = None,
+        lazy: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        model: Module,
+            the model to be trained
+        model_config: dict,
+            the configuration of the model,
+            used to keep a record in the checkpoints
+        train_config: dict,
+            the configuration of the training,
+            including configurations for the data loader, for the optimization, etc.
+            will also be recorded in the checkpoints.
+            `train_config` should at least contain the following keys:
+                "monitor": str,
+                "loss": str,
+                "n_epochs": int,
+                "batch_size": int,
+                "learning_rate": float,
+                "lr_scheduler": str,
+                    "lr_step_size": int, optional, depending on the scheduler
+                    "lr_gamma": float, optional, depending on the scheduler
+                    "max_lr": float, optional, depending on the scheduler
+                "optimizer": str,
+                    "decay": float, optional, depending on the optimizer
+                    "momentum": float, optional, depending on the optimizer
+        device: torch.device, optional,
+            the device to be used for training
+        lazy: bool, default True,
+            whether to initialize the data loader lazily
+
+        """
+        super().__init__(
+            model=model,
+            dataset_cls=LUDB,
+            model_config=model_config,
+            train_config=train_config,
+            device=device,
+            lazy=lazy,
+        )
+
+    def _setup_dataloaders(
+        self,
+        train_dataset: Optional[Dataset] = None,
+        val_dataset: Optional[Dataset] = None,
+    ) -> None:
+        """
+        setup the dataloaders for training and validation
+
+        Parameters
+        ----------
+        train_dataset: Dataset, optional,
+            the training dataset
+        val_dataset: Dataset, optional,
+            the validation dataset
+
+        """
+        if train_dataset is None:
+            train_dataset = self.dataset_cls(config=self.train_config, training=True, lazy=False)
+
+        if self.train_config.debug:
+            val_train_dataset = train_dataset
+        else:
+            val_train_dataset = None
+        if val_dataset is None:
+            val_dataset = self.dataset_cls(config=self.train_config, training=False, lazy=False)
+
+        # https://discuss.pytorch.org/t/guidelines-for-assigning-num-workers-to-dataloader/813/4
+        num_workers = 4
+
+        self.train_loader = DataLoader(
+            dataset=train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(), #only pin_memory if CUDA is available
+            drop_last=False,
+            collate_fn=collate_fn,
+        )
+
+        if self.train_config.debug:
+            self.val_train_loader = DataLoader(
+                dataset=val_train_dataset,
+                batch_size=self.batch_size,
+                shuffle=True,
+                num_workers=num_workers,
+                pin_memory=torch.cuda.is_available(), #only pin_memory if CUDA is available
+                drop_last=False,
+                collate_fn=collate_fn,
+            )
+        else:
+            self.val_train_loader = None
+        self.val_loader = DataLoader(
+            dataset=val_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(), #only pin_memory if CUDA is available
+            drop_last=False,
+            collate_fn=collate_fn,
+        )
+    def load_checkpoint(self, checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.start_epoch = checkpoint.get("epoch", 0) + 1
+
+    def run_one_step(self, *data: Tuple[torch.Tensor, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Parameters
+        ----------
+        data: tuple of Tensors,
+            the data to be processed for training one step (batch),
+            should be of the following order:
+            signals, labels, *extra_tensors
+
+        Returns
+        -------
+        preds: Tensor,
+            the predictions of the model for the given data
+        labels: Tensor,
+            the labels of the given data
+
+        """
+        signals, labels = data
+        signals = signals.to(self.device)
+        # labels of shape (batch_size, seq_len) if loss is CrossEntropyLoss
+        # otherwise of shape (batch_size, seq_len, n_classes)
+        labels = labels.to(self.device)
+        preds = self.model(signals)  # of shape (batch_size, seq_len, n_classes)
+        if self.train_config.loss == "CrossEntropyLoss":
+            preds = preds.permute(0, 2, 1)  # of shape (batch_size, n_classes, seq_len)
+            # or use the following
+            # preds = pres.reshape(-1, preds.shape[-1])  # of shape (batch_size * seq_len, n_classes)
+            # labels = labels.reshape(-1)  # of shape (batch_size * seq_len,)
+        return preds, labels
+
+    @torch.no_grad()
+    def evaluate(self, data_loader: DataLoader) -> Dict[str, float]:
+        """ """
+        self.model.eval()
+
+        all_scalar_preds = []
+        all_mask_preds = []
+        all_labels = []
+
+        for signals, labels in data_loader:
+            signals = signals.to(device=self.device, dtype=self.dtype)
+            labels = labels.numpy()
+            all_labels.append(labels)
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            model_output = self._model.inference(signals)
+            all_scalar_preds.append(model_output.prob)
+            all_mask_preds.append(model_output.mask)
+
+        # all_scalar_preds of shape (n_samples, seq_len, n_classes)
+        all_scalar_preds = np.concatenate(all_scalar_preds, axis=0)
+        # all_scalar_preds of shape (n_samples, seq_len)
+        all_mask_preds = np.concatenate(all_mask_preds, axis=0)
+        # all_labels of shape (n_samples, seq_len) if loss is CrossEntropyLoss
+        # otherwise of shape (n_samples, seq_len, n_classes)
+        all_labels = np.concatenate(all_labels, axis=0)
+
+        if self.train_config.loss != "CrossEntropyLoss":
+            all_labels = all_labels.argmax(axis=-1)  # (n_samples, seq_len, n_classes) -> (n_samples, seq_len)
+
+        # print(f"all_labels.shape: {all_labels.shape}, nan: {np.isnan(all_labels).any()}, inf: {np.isinf(all_labels).any()}")
+        # print(f"all_scalar_preds.shape: {all_scalar_preds.shape}, nan: {np.isnan(all_scalar_preds).any()}, inf: {np.isinf(all_scalar_preds).any()}")
+        # print(f"all_mask_preds.shape: {all_mask_preds.shape}, nan: {np.isnan(all_mask_preds).any()}, inf: {np.isinf(all_mask_preds).any()}")
+
+        # eval_res are scorings of onsets and offsets of pwaves, qrs complexes, twaves,
+        # each scoring is a dict consisting of the following metrics:
+        # sensitivity, precision, f1_score, mean_error, standard_deviation
+        eval_res_split = compute_metrics(
+            np.repeat(all_labels[:, np.newaxis, :], self.model_config.n_leads, axis=1),
+            np.repeat(all_mask_preds[:, np.newaxis, :], self.model_config.n_leads, axis=1),
+            self._cm,
+            self.train_config.fs,
+        )
+
+        # TODO: provide numerical values for the metrics from all of the dicts of eval_res
+        # New: only wave classes that have meaningful on/offset
+        wave_keys = [wf for wf in self._cm.keys() if wf not in ["bg", "background", "i"]]
+
+        eval_res = {
+            metric: np.nanmean([eval_res_split[f"{wf}_{pos}"][metric] for wf in wave_keys for pos in ["onset", "offset"]])
+            for metric in [
+                "sensitivity",
+                "precision",
+                "f1_score",
+                "mean_error",
+                "standard_deviation",
+            ]
+        }
+
+        # ---------- background (bg / 'i') metrics: point-wise binary evaluation ----------
+        bg_idx = self.train_config.class_map.get("i", None)
+        if bg_idx is not None:
+            # Flatten to 1-D so each time-sample is one example
+            y_true = all_labels.reshape(-1).astype(np.int64)       # GT class index per sample
+            y_pred = all_mask_preds.reshape(-1).astype(np.int64)   # Predicted class index per sample
+
+            # Boolean masks for background vs foreground
+            bg_true = (y_true == bg_idx)
+            bg_pred = (y_pred == bg_idx)
+
+            # Confusion counts for background-as-positive binary task
+            tp = int(np.sum(bg_true & bg_pred))        # GT=bg and Pred=bg
+            fp = int(np.sum(~bg_true & bg_pred))       # GT=fg but Pred=bg
+            fn = int(np.sum(bg_true & ~bg_pred))       # GT=bg but Pred=fg
+            tn = int(np.sum(~bg_true & ~bg_pred))      # GT=fg and Pred=fg
+
+            eps = 1e-8  # to avoid zero-division
+            bg_precision = tp / (tp + fp + eps)
+            bg_recall    = tp / (tp + fn + eps)
+            bg_f1        = 2 * bg_precision * bg_recall / (bg_precision + bg_recall + eps)
+            bg_acc       = (tp + tn) / (tp + fp + fn + tn + eps)
+
+            # Rates you likely care about:
+            # - bg_to_fg_rate: portion of true-background mislabeled as any foreground
+            # - fg_to_bg_rate: portion of true-foreground mislabeled as background
+            n_bg = int(np.sum(bg_true))
+            n_fg = int(np.sum(~bg_true))
+            bg_to_fg_rate = fn / (n_bg + eps)
+            fg_to_bg_rate = fp / (n_fg + eps)
+
+            # Add to eval results
+            eval_res.update({
+                "bg/precision":      float(bg_precision),
+                "bg/recall":         float(bg_recall),
+                "bg/f1":             float(bg_f1),
+                "bg/accuracy":       float(bg_acc),
+                "bg/bg_to_fg_rate":  float(bg_to_fg_rate),
+                "bg/fg_to_bg_rate":  float(fg_to_bg_rate),
+                "bg/support_bg":     float(n_bg),   # optional: how many bg samples existed
+                "bg/support_fg":     float(n_fg),   # optional: how many fg samples existed
+            })
+
+        self.model.train()
+
+        return eval_res
+
+    @property
+    def _cm(self) -> Dict[str, str]:
+        """ """
+        return {
+            #"pwave": self.train_config.class_map["p"],
+            "qrs": self.train_config.class_map["N"],
+            #"twave": self.train_config.class_map["t"],
+            #"bg": self.train_config.class_map["i"], # add bg to the metric computation
+        }
+
+    @property
+    def batch_dim(self) -> int:
+        """
+        batch dimension,
+        """
+        return 0
+
+    @property
+    def extra_required_train_config_fields(self) -> List[str]:
+        """ """
+        return []
+
+    # @property
+    # def save_prefix(self) -> str:
+    #     return f"{self._model.__name__}_{self.model_config.cnn.name}_epoch"
+
+    # def extra_log_suffix(self) -> str:
+    #     return super().extra_log_suffix() + f"_{self.model_config.cnn.name}"
+
+
+def get_args(**kwargs):
+    """ """
+    cfg = deepcopy(kwargs)
+    parser = argparse.ArgumentParser(
+        description="Train the Model on LUDB",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    # parser.add_argument(
+    #     "-l", "--learning-rate",
+    #     metavar="LR", type=float, nargs="?", default=0.001,
+    #     help="Learning rate",
+    #     dest="learning_rate")
+    parser.add_argument(
+        "-b",
+        "--batch-size",
+        type=int,
+        default=32,
+        help="the batch size for training",
+        dest="batch_size",
+    )
+    parser.add_argument(
+        "-m",
+        "--model-name",
+        type=str,
+        default="unet",
+        help="name of the model to train, `unet` or `subtract_unet`",
+        dest="model_name",
+    )
+    parser.add_argument(
+        "--keep-checkpoint-max",
+        type=int,
+        default=50,
+        help="maximum number of checkpoints to keep. If set 0, all checkpoints will be kept",
+        dest="keep_checkpoint_max",
+    )
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="adamw_amsgrad",
+        help="training optimizer",
+        dest="train_optimizer",
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="path to a checkpoint (.pth.tar) to resume training from",
+        dest="resume_from",
+    )
+    parser.add_argument(
+        "--debug",
+        type=str2bool,
+        default=False,
+        help="train with more debugging information",
+        dest="debug",
+    )
+
+    args = vars(parser.parse_args())
+
+    cfg.update(args)
+
+    return CFG(cfg)
+
+
+if __name__ == "__main__":
+    train_config = get_args(**TrainCfg)
+    
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() and torch.backends.mps.is_built():
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+    print ("[INFO] Device =", device)
+
+
+    model_config = deepcopy(ModelCfg)
+
+    model = ECG_UNET_LUDB(n_leads=model_config.n_leads, config=model_config)
+
+    if torch.cuda.device_count() > 1:
+        model = DP(model)
+        # model = DDP(model)
+
+    model.to(device=device)
+
+    # Create optimizer BEFORE loading checkpoint
+    optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.learning_rate)
+
+    if train_config.resume_from:
+        checkpoint = torch.load(train_config.resume_from, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        start_epoch = checkpoint.get("epoch", 0) + 1
+        print(f"[INFO] Resumed training from {train_config.resume_from}, starting at epoch {start_epoch}")
+
+    trainer = LUDBTrainer(
+        model=model,
+        model_config=model_config,
+        train_config=train_config,
+        device=device,
+        lazy=False,
+    )
+    
+
+    try:
+        best_model_state_dict = trainer.train()
+    except KeyboardInterrupt:
+        try:
+            sys.exit(0)
+        except SystemExit:
+            os._exit(0)
