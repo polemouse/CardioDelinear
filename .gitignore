@@ -8,3 +8,6 @@ cche
 data/lry/*.LRY
 data/lry/*.LRY
 outputs
+__pycache__/
+external/
+log/
