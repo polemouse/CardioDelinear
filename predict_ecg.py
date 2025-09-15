@@ -27,11 +27,12 @@ from dataset import LUDB as LUDataset  # TorchECG benchmark dataset class
 from cfg import CFG as TCFG  # runtime CFG wrapper
 
 from ludb_landmarks import DB_DIR, REC_ID
-import plotly.graph_objects as go
+from plot import plot_interactive_ecg
 
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+from lry import LRYRecord
 
 # ---------- Setting ----------
 CALCULATE_PEAKS = False
@@ -43,6 +44,11 @@ CKPT_PATH = "/Users/steven/.cache/torch_ecg/saved_models/BestModel_ECG_UNET_LUDB
 
 CFG_DIR   = "/Users/steven/Project/CardioDelinear/torch_ecg-0.0.31/benchmarks/train_unet_ludb"  # contains cfg.py
 LOCAL_LUDB_DIR = "/Users/steven/Project/CardioDelinear/data/ludb/data"  # where 1.hea/1.dat etc live
+
+PATH_LRY = "/Users/steven/Project/CardioDelinear/data/lry/"
+LRY_FILE = "小鼠1-16173016-converted-2000HZ"
+
+USE_DB = "LRY" #LRY, LUDB, QUDB
 
 # ---------- Inference settings ----------
 RECORD_ID = 30          # which LUDB record to visualize
@@ -258,7 +264,35 @@ def read_ludb_local(rec_id: int) -> Tuple[np.ndarray, int]:
 
     return signals, fs
 
+def read_lry_local(path_lry: str, lry_file: str) -> Tuple[np.ndarray, int]:
+    """
+    Read LUDB record via TorchECG benchmark dataset (no WFDB used here).
+    Returns:
+        signals: (n_leads, n_samples), float
+        fs: sampling rate in Hz
+    """
+    # Build a fresh cfg for the dataset.
+    # NOTE: DB_DIR must be the parent folder that contains the `data/` subfolder.
+    cfg = TCFG(TrainCfg)
+    cfg.db_dir = DB_DIR      # e.g. "/Users/steven/.../data/ludb" (NOT ".../data/ludb/data")
+    cfg.lazy = True          # load full-length records; no window sampling
 
+    # Create dataset reader and fetch the record (1-based rec_id -> 0-based index)
+    ds = LRYRecord(
+        path_lry=path_lry + lry_file +".LRY",
+        path_r_on=path_lry + lry_file+"-R_on.txt",
+        path_r_off=path_lry + lry_file+"-R_off.txt",
+    )
+    ds.read()
+    
+    # fs: prefer reader.fs if present, otherwise fall back to cfg.fs
+    fs = ds.fs
+
+    # Ensure dtype and layout are exactly (n_leads, T)
+    signals = ds.signals
+    signals = signals.astype(float)
+
+    return signals, fs
 
 def ensure_length(sig_2d: np.ndarray, want_len: int) -> np.ndarray:
     """
@@ -390,85 +424,6 @@ def plot_with_annotations(sig_1d: np.ndarray, fs: int,
     plt.tight_layout()
     plt.show()
 
-def plot_interactive_ecg(sig, fs, spans, peaks=None, title="ECG", out_html="ecg_interactive.html"):
-    """
-    Create an interactive ECG plot with P/QRS/T shaded spans and optional peak markers.
-
-    Parameters
-    ----------
-    sig : 1D np.ndarray
-        Single-lead signal.
-    fs : int
-        Sampling rate (Hz).
-    spans : dict
-        {"P":[(s,e),...], "QRS":[(s,e),...], "T":[(s,e),...]} in sample indices.
-    peaks : dict or None
-        e.g., {"R":[idx1, idx2, ...]} in sample indices.
-    title : str
-        Figure title.
-    out_html : str
-        Output HTML file path.
-    """
-    t = np.arange(sig.size) / float(fs)
-
-    # --- fixed colors ---
-    class_colors = {"P":"#FF7F0E", "QRS":"#D62728", "T":"#2CA02C"}  # orange/red/green
-
-    fig = go.Figure()
-
-    # 1) signal line (Scattergl is fast for large arrays)
-    fig.add_trace(go.Scattergl(
-        x=t, y=sig, name="Signal", mode="lines",
-        line=dict(width=1.2, color="#1f77b4"),
-        hovertemplate="t=%{x:.3f}s<br>amp=%{y:.4f}<extra>Signal</extra>"
-    ))
-
-    # 2) add shaded spans as shapes, and add invisible traces for legend toggling
-    #    (click legend to hide/show a class)
-    for cls in ("P","QRS","T"):
-        col = class_colors[cls]
-        segs = spans.get(cls, [])
-        # An invisible trace only for legend entry and toggling
-        fig.add_trace(go.Scatter(
-            x=[None], y=[None], mode="lines", line=dict(color=col, width=12),
-            name=cls, showlegend=True
-        ))
-        # Add shapes for each segment
-        for s,e in segs:
-            fig.add_shape(
-                type="rect",
-                x0=s/fs, x1=e/fs,
-                y0=min(sig), y1=max(sig),
-                fillcolor=col, opacity=0.20, line_width=0, layer="below"
-            )
-
-    # 3) optional peak markers
-    if peaks:
-        for name, idxs in peaks.items():
-            if not idxs: 
-                continue
-            tt = np.array(idxs)/fs
-            yy = np.interp(tt, t, sig)
-            fig.add_trace(go.Scatter(
-                x=tt, y=yy, mode="markers",
-                name=f"{name} peaks", marker=dict(symbol="x", size=8, color="#000000"),
-                hovertemplate=f"{name} @ %{{x:.3f}}s<br>amp=%{{y:.4f}}<extra></extra>"
-            ))
-
-    fig.update_layout(
-        title={"text": title, "y": 0.98, "x": 0.5, "xanchor": "center", "yanchor": "top"},
-        xaxis_title="Time (s)",
-        yaxis_title="Amplitude (a.u.)",
-        template="plotly_white",
-        legend=dict(orientation="h", yanchor="bottom", y=1, xanchor="left", x=0),
-        margin=dict(l=60, r=20, t=110, b=50),
-    )
-
-    # Better initial view
-    fig.update_xaxes(rangeslider_visible=False)
-    fig.update_yaxes(fixedrange=False)
-
-    fig.write_html(out_html, include_plotlyjs="cdn", auto_open=True)  # opens in browser
 
 def majority_filter_labels(pred: np.ndarray, k: int = 11) -> np.ndarray:
     """
@@ -526,7 +481,16 @@ def main():
     model.eval()
 
     # 3) Read LUDB locally
-    signals, fs = read_ludb_local(RECORD_ID)
+    match USE_DB:
+        case "LUDB":
+            signals, fs = read_ludb_local(RECORD_ID)
+        case "LRY":
+            signals, fs = read_lry_local(path_lry=PATH_LRY, lry_file=LRY_FILE)
+        case "QUDB":
+            #signals, fs = read_qudb_local(RECORD_ID) #FIXME not implemented
+            pass
+        case _:
+            raise ValueError("[Predict_ecg]] Unknown USE_DB value")
 
     # 4) Determine effective settings from cfg
     n_leads = int(cfg.get("n_leads") or cfg.get("in_channels") or signals.shape[0])
@@ -677,7 +641,13 @@ def main():
 
 
     # 8) Plot
-    title = f"LUDB rec {RECORD_ID} lead {lead_idx+1} | {START_SECONDS}-{START_SECONDS+WINDOW_SECONDS}s \n"
+    match USE_DB:
+        case "LUDB":
+            title = f"LUDB rec {RECORD_ID} lead {lead_idx+1} | {START_SECONDS}-{START_SECONDS+WINDOW_SECONDS}s \n"
+        case "LRY":
+            title = f"LRY rec {LRY_FILE} lead {lead_idx+1} | {START_SECONDS}-{START_SECONDS+WINDOW_SECONDS}s \n"
+        case _:
+            title = f"Unknown DB | lead {lead_idx+1} | {START_SECONDS}-{START_SECONDS+WINDOW_SECONDS}s \n"
     #plot_with_annotations(sig, fs_eff, spans=spans, peaks=peaks, title=title)
     if CALCULATE_PEAKS:
         plot_interactive_ecg(sig, fs_eff, spans=spans, peaks=peaks, title=title,out_html="ludb_interactive.html")
